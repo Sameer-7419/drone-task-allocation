@@ -1,18 +1,24 @@
-# Install dependencies into the Python interpreter used by Webots R2025a.
-$python = "C:\Users\Sameer Gupta\AppData\Local\Programs\Python\Python313\python.exe"
+# Install dependencies into the interpreter that Webots is configured to use.
+# Override this when Webots uses a non-default interpreter, for example:
+# .\install_dependencies.ps1 -PythonExecutable "C:\Python312\python.exe"
+param([string]$PythonExecutable = "")
 
-if (-not (Test-Path $python)) {
-    Write-Error "Python 3.13 was not found at: $python"
-    Write-Host "Run: where.exe python"
+if (-not $PythonExecutable) {
+    $command = Get-Command python -ErrorAction SilentlyContinue
+    if ($command) { $PythonExecutable = $command.Source }
+}
+
+if (-not $PythonExecutable -or -not (Test-Path $PythonExecutable)) {
+    Write-Error "No Python interpreter was found. Pass -PythonExecutable with the interpreter configured in Webots."
     exit 1
 }
 
-& $python -m pip install --upgrade pip
-& $python -m pip install numpy
+& $PythonExecutable -m pip install --upgrade pip
+& $PythonExecutable -m pip install numpy torch
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "NumPy installation failed."
     exit $LASTEXITCODE
 }
 
-& $python -c "import numpy; print('NumPy OK:', numpy.__version__)"
+& $PythonExecutable -c "import numpy, torch; print('NumPy OK:', numpy.__version__); print('PyTorch OK:', torch.__version__)"

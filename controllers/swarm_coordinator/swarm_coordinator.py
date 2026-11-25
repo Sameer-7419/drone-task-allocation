@@ -1,5 +1,5 @@
 from controller import Supervisor
-import sys, os, csv, time, math
+import sys, os, csv, time
 import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -13,9 +13,15 @@ from qrdpso.qrdpso import QRDPSO
 
 TIME_STEP = 50
 NUM_DRONES = 3
-COMMUNICATION_RANGE = 6.0
+# Matches the communication range used to train the saved MAPPO checkpoints.
+COMMUNICATION_RANGE = 5.5
 WAYPOINT_TOLERANCE = 0.35
 MAX_CYCLES_PER_MODE = 900
+# NumPy-only actor exported from a trained MAPPO checkpoint. It avoids a
+# PyTorch dependency inside Webots; create it with mappo.export_webots_policy.
+MAPPO_POLICY = os.path.join(ROOT, "results", "models", "ac_mappo_seed_7.npz")
+MAPPO_ARENA_SIZE = 10.0
+MAPPO_ENERGY_BUDGET = 40.0
 
 class Coordinator(Supervisor):
     def __init__(self):
@@ -35,12 +41,22 @@ class Coordinator(Supervisor):
             d.getField("translation").setSFVec3f(p.tolist())
         self.step(TIME_STEP)
 
-    def set_positions(self, targets, alpha=0.045):
+    def set_positions(self, targets, alpha=0.045, max_distance=None):
         current = self.positions()
         delta = np.asarray(targets) - current
-        next_pos = current + np.clip(delta, -alpha, alpha)
+        if max_distance is None:
+            # Preserve the original component-wise motion used by PSO modes.
+            next_pos = current + np.clip(delta, -alpha, alpha)
+        else:
+            distances = np.linalg.norm(delta, axis=1, keepdims=True)
+            scale = np.minimum(1.0, max_distance / np.maximum(distances, 1e-9))
+            next_pos = current + delta * scale
         for d, p in zip(self.drones, next_pos):
             d.getField("translation").setSFVec3f(p.tolist())
+
+    @staticmethod
+    def disconnected_count(components):
+        return NUM_DRONES - max((len(component) for component in components), default=0)
 
     def run_mode(self, mode):
         self.reset()
@@ -82,12 +98,72 @@ class Coordinator(Supervisor):
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 writer.writerow([
                     self.getTime(), mode, cycle, mean_link_connectivity(a),
-                    len(comps), NUM_DRONES - len(comps[0]) if len(comps) else NUM_DRONES,
+                    len(comps), self.disconnected_count(comps),
                     total_distance, len(completed), elapsed_ms
                 ])
                 f.flush()
 
                 if len(completed) == len(self.tasks):
+                    break
+
+    def run_mappo_mode(self):
+        """Run decentralized MAPPO actor inference in the Webots world."""
+        # Keep MAPPO optional at controller startup.  A missing PyTorch package
+        # or checkpoint must never stop the RDPSO/QRDPSO visual simulation.
+        try:
+            from mappo.webots_inference import MAPPOActorPolicy, action_mask, local_observations
+            policy = MAPPOActorPolicy(MAPPO_POLICY)
+        except Exception as error:
+            print("AC-MAPPO was skipped. RDPSO and QRDPSO completed normally.")
+            print(f"AC-MAPPO startup error: {type(error).__name__}: {error}")
+            print("Create the NumPy actor file with mappo.export_webots_policy and verify MAPPO_POLICY.")
+            return
+        self.reset()
+        completed = np.zeros(len(self.tasks), dtype=bool)
+        energy = np.full(NUM_DRONES, MAPPO_ENERGY_BUDGET, dtype=float)
+        total_distance = 0.0
+        previous = self.positions()
+
+        with open(self.log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            for cycle in range(MAX_CYCLES_PER_MODE):
+                start = time.perf_counter()
+                positions_3d = self.positions()
+                adjacency = adjacency_matrix(positions_3d, COMMUNICATION_RANGE)
+                components = connected_components(adjacency)
+                link_ratio = mean_link_connectivity(adjacency)
+                observations = local_observations(
+                    positions_3d[:, :2], self.tasks[:, :2], completed, energy, adjacency,
+                    link_ratio, MAPPO_ARENA_SIZE, MAPPO_ENERGY_BUDGET,
+                )
+                actions = policy.select_actions(observations, action_mask(completed, NUM_DRONES))
+
+                # Action 0..N-1 selects a task; N is the trained idle action.
+                targets = positions_3d.copy()
+                for drone, task in enumerate(actions):
+                    if task < len(self.tasks) and not completed[task]:
+                        targets[drone] = self.tasks[task]
+                # Match the 0.35-distance movement increment used during MAPPO training.
+                self.set_positions(targets, max_distance=0.35)
+                self.step(TIME_STEP)
+
+                now = self.positions()
+                movement = np.linalg.norm(now - previous, axis=1)
+                total_distance += float(movement.sum())
+                energy = np.maximum(0.0, energy - movement)
+                previous = now
+                for drone, task in enumerate(actions):
+                    if task < len(self.tasks) and np.linalg.norm(now[drone] - self.tasks[task]) <= WAYPOINT_TOLERANCE:
+                        completed[task] = True
+
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                writer.writerow([
+                    self.getTime(), "AC-MAPPO", cycle, link_ratio,
+                    len(components), self.disconnected_count(components),
+                    total_distance, int(completed.sum()), elapsed_ms,
+                ])
+                f.flush()
+                if completed.all() or np.all(energy <= 0):
                     break
 
     def run(self):
@@ -100,6 +176,7 @@ class Coordinator(Supervisor):
             ])
         self.run_mode("RDPSO")
         self.run_mode("QRDPSO")
+        self.run_mappo_mode()
 
 coord = Coordinator()
 coord.run()
